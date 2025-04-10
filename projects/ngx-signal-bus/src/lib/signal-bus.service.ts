@@ -16,6 +16,16 @@ export interface BusEvent<T = unknown> {
   timestamp: number;
 }
 
+/** Represents the options for subscribing to an event bus event. */
+export interface SubscribeOptions<T> {
+  /** The key/query string to match events against. */
+  key: string;
+  /** The callback function to execute when an event matches the query. */
+  callback: (event: BusEvent<T>) => void;
+  /** Optional DestroyRef for auto-cleaning subscriptions */
+  destroyRef?: DestroyRef;
+}
+
 /** Represents a subscription to the event bus. */
 export interface BusEventSubscription {
   unsubscribe: () => void;
@@ -27,10 +37,7 @@ export interface BusEventSubscription {
 export class SignalBusService {
   private readonly eventQueue = signal<BusEvent[]>([]);
   private readonly eventRegistry = signal<Map<string, BusEvent>>(new Map());
-  private readonly subscribers = new Map<
-    string,
-    ((event: BusEvent<unknown>) => void)[]
-  >();
+  private readonly subscribers = new Map<string, ((event: BusEvent<unknown>) => void)[]>();
 
   constructor(injector: Injector) {
     effect(
@@ -65,15 +72,9 @@ export class SignalBusService {
   }
 
   /** Subscribes to events matching a query, optionally auto-cleaning with DestroyRef. Returns a BusEventSubscription object. */
-  subscribe<T>(
-    query: string,
-    callback: (event: BusEvent<T>) => void,
-    destroyRef?: DestroyRef
-  ): BusEventSubscription {
-    const unsubscribeFn = this.internalSubscribe(query, callback, destroyRef);
-    return {
-      unsubscribe: unsubscribeFn,
-    };
+  subscribe<T>({ key, callback, destroyRef }: SubscribeOptions<T>): BusEventSubscription {
+    const unsubscribeFn = this.internalSubscribe(key, callback, destroyRef);
+    return { unsubscribe: unsubscribeFn };
   }
 
   /** Returns a Signal for observing the latest event for a specific key, or null if none exists. */
@@ -85,9 +86,7 @@ export class SignalBusService {
   toSignalMultiple<T>(keys: string[]): Signal<BusEvent<T>[]> {
     return computed(() => {
       const registry = this.eventRegistry();
-      return keys
-        .map((key) => registry.get(key) as BusEvent<T>)
-        .filter(Boolean);
+      return keys.map((key) => registry.get(key) as BusEvent<T>).filter(Boolean);
     });
   }
 
@@ -142,10 +141,7 @@ export class SignalBusService {
     });
   }
 
-  private unsubscribe<T>(
-    query: string,
-    callback: (event: BusEvent<T>) => void
-  ): void {
+  private unsubscribe<T>(query: string, callback: (event: BusEvent<T>) => void): void {
     const callbacks = this.subscribers.get(query);
     if (!callbacks) return;
 

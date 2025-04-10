@@ -58,3 +58,69 @@ yarn add ngx-signal-bus
 - `reset()`
    - Clears the entire event registry.
 
+### Basic examples
+
+```ts
+import { SignalBusService, BusEvent } from 'ngx-signal-bus';
+
+interface DemoData {
+  text: string;
+  value: number;
+}
+
+@Component({
+  selector: 'app-root',
+  standalone: true,
+  imports: [CommonModule],
+  template: `
+    <h2>Signal Bus Demo</h2>
+
+    <div>
+      <h3>Emit Events</h3>
+      <button (click)="emitMessageEvent()">Emit Message Event</button>
+      <button (click)="emitDataEvent()">Emit Data Event</button>
+    </div>
+
+    <hr />
+
+    <div>
+      <h3>Watch Events (Signal)</h3>
+      Data event: <br /> 
+      <pre>{{ dataEvent() | json }}</pre>
+      Message event: <br /> 
+      <pre>{{ messageEvent() | json }}</pre>
+    </div>
+  `,
+})
+export class App implements OnDestroy {
+  private readonly bus = inject(SignalBusService);
+  private readonly destroyRef = inject(DestroyRef);
+
+  dataEvent = this.bus.toSignal<DemoData>('data');
+  messageEvent = this.bus.toSignal<void>('message');
+
+  dataEventSub = this.bus.subscribe<DemoData>('data', (event) => {
+    console.log(`Data event: `, event);
+  }); // Not auto-unsubscribed;
+
+  constructor() {
+   this.bus.subscribe<DemoData>({
+      key: 'message',
+      callback: (event)=>console.log(event),
+      destroyRef: this.destroyRef
+    }) // Auto-unsubscribed
+  }
+
+  ngOnDestroy(): void {
+    this.dataEventSub.unsubscribe();
+  }
+
+  emitMessageEvent(): void {
+    this.bus.emit('message', 'A simple message');
+  }
+
+  emitDataEvent(): void {
+    this.bus.emit('data', { text: 'Hello from data event', value: 123 });
+  }
+}
+```
