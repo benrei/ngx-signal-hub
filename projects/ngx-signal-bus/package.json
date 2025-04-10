@@ -1,0 +1,21 @@
+{
+  "name": "ngx-signal-bus",
+  "version": "0.0.2",
+  "keywords": [
+    "angular",
+    "bus",
+    "event",
+    "event bus",
+    "service",
+    "signal"
+  ],
+  "license": "MIT",
+  "peerDependencies": {
+    "@angular/common": ">16.0.0",
+    "@angular/core": ">16.0.0"
+  },
+  "dependencies": {
+    "tslib": "^2.3.0"
+  },
+  "sideEffects": false
+}
