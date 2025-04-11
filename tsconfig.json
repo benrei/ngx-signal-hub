@@ -10,9 +10,7 @@
     "noImplicitReturns": true,
     "noFallthroughCasesInSwitch": true,
     "paths": {
-      "ngx-signal-bus": [
-        "./dist/ngx-signal-bus"
-      ]
+      "ngx-signal-hub": ["./dist/ngx-signal-hub"]
     },
     "skipLibCheck": true,
     "isolatedModules": true,
