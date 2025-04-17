@@ -364,6 +364,193 @@ export class SignalHubService {
     });
     return subscription;
   }
+  /**
+   * Subscribes to the latest events from multiple keys, invoking the callback with an array of events
+   * whenever any key emits a new event, provided all keys have emitted at least once.
+   *
+   * @param options - Options including keys, callback, and optional settings.
+   * @returns A HubSubscription object with an unsubscribe method.
+   * @throws Error if keys array is empty or contains invalid keys.
+   *
+   * @example
+   * ```typescript
+   * signalHub.onCombineLatest({
+   *   keys: ['user:login', 'user:logout'],
+   *   callback: (events) => console.log(events.map(e => e.data)),
+   *   replayLatest: true,
+   *   destroyRef: inject(DestroyRef),
+   *   onError: (err, events) => console.error('Error:', err, events),
+   * });
+   * ```
+   */
+  onCombineLatest<T>({
+    keys,
+    callback,
+    destroyRef,
+    replayLatest,
+    onError,
+  }: {
+    keys: string[];
+    callback: (events: HubEvent<T>[]) => void | Promise<void>;
+    destroyRef?: DestroyRef;
+    replayLatest?: boolean;
+    onError?: (error: unknown, events: HubEvent<T>[]) => void;
+  }): HubSubscription {
+    if (!keys.length) throw new Error('Keys array cannot be empty');
+    if (keys.some((key) => !key)) throw new Error('All keys must be non-empty');
+
+    const safeCallback = callback as (events: HubEvent<unknown>[]) => void | Promise<void>;
+    const safeOnError = onError as
+      | ((error: unknown, events: HubEvent<unknown>[]) => void)
+      | undefined;
+
+    // Check if all keys have events for replay
+    if (replayLatest) {
+      const registry = this.eventRegistry();
+      const latestEvents = keys.map((key) => registry.get(key) as HubEvent<T>).filter(Boolean);
+      if (latestEvents.length === keys.length) {
+        try {
+          safeCallback(latestEvents);
+        } catch (error) {
+          if (safeOnError) {
+            safeOnError(error, latestEvents);
+          } else {
+            console.warn(`Replay error for combineLatest:`, error);
+          }
+        }
+      }
+    }
+
+    // Subscribe to each key
+    const subscriptions = keys.map((key) =>
+      this.on({
+        key,
+        callback: () => {
+          // Check if all keys have events
+          const registry = this.eventRegistry();
+          const events = keys.map((k) => registry.get(k) as HubEvent<T>).filter(Boolean);
+          if (events.length === keys.length) {
+            try {
+              safeCallback(events);
+            } catch (error) {
+              if (safeOnError) {
+                safeOnError(error, events);
+              } else {
+                console.warn(`Callback error for combineLatest:`, error);
+              }
+            }
+          }
+        },
+        // Adapt onError for single event
+        onError: safeOnError
+          ? (error, event) => safeOnError(error, [event]) // Wrap single event in array
+          : undefined,
+      })
+    );
+
+    // Handle unsubscribe
+    let manualUnsubscribe = true;
+    if (destroyRef) {
+      manualUnsubscribe = false;
+      destroyRef.onDestroy(() => subscriptions.forEach((sub) => sub.unsubscribe()));
+    }
+
+    return {
+      unsubscribe: () => {
+        if (manualUnsubscribe) {
+          subscriptions.forEach((sub) => sub.unsubscribe());
+        }
+      },
+    };
+  }
+
+  /**
+   * Subscribes to the latest events from multiple keys with an asynchronous callback,
+   * invoking the callback with an array of events whenever any key emits a new event,
+   * provided all keys have emitted at least once.
+   *
+   * @param options - Options including keys, callback, and optional settings.
+   * @returns A Promise resolving to a HubSubscription object with an unsubscribe method.
+   * @throws Error if keys array is empty or contains invalid keys.
+   */
+  async onCombineLatestAsync<T>({
+    keys,
+    callback,
+    destroyRef,
+    replayLatest,
+    onError,
+  }: {
+    keys: string[];
+    callback: (events: HubEvent<T>[]) => Promise<void>;
+    destroyRef?: DestroyRef;
+    replayLatest?: boolean;
+    onError?: (error: unknown, events: HubEvent<T>[]) => void;
+  }): Promise<HubSubscription> {
+    if (!keys.length) throw new Error('Keys array cannot be empty');
+    if (keys.some((key) => !key)) throw new Error('All keys must be non-empty');
+
+    const safeCallback = callback as (events: HubEvent<unknown>[]) => Promise<void>;
+    const safeOnError = onError as
+      | ((error: unknown, events: HubEvent<unknown>[]) => void)
+      | undefined;
+
+    // Check if all keys have events for replay
+    if (replayLatest) {
+      const registry = this.eventRegistry();
+      const latestEvents = keys.map((key) => registry.get(key) as HubEvent<T>).filter(Boolean);
+      if (latestEvents.length === keys.length) {
+        try {
+          await safeCallback(latestEvents);
+        } catch (error) {
+          if (safeOnError) {
+            safeOnError(error, latestEvents);
+          } else {
+            console.warn(`Replay error for combineLatestAsync:`, error);
+          }
+        }
+      }
+    }
+
+    // Subscribe to each key
+    const subscriptions = keys.map((key) =>
+      this.on({
+        key,
+        callback: async () => {
+          // Check if all keys have events
+          const registry = this.eventRegistry();
+          const events = keys.map((k) => registry.get(k) as HubEvent<T>).filter(Boolean);
+          if (events.length === keys.length) {
+            try {
+              await safeCallback(events);
+            } catch (error) {
+              if (safeOnError) {
+                safeOnError(error, events);
+              } else {
+                console.warn(`Callback error for combineLatestAsync:`, error);
+              }
+            }
+          }
+        },
+        // Adapt onError for single event
+        onError: safeOnError ? (error, event) => safeOnError(error, [event]) : undefined,
+      })
+    );
+
+    // Handle unsubscribe
+    let manualUnsubscribe = true;
+    if (destroyRef) {
+      manualUnsubscribe = false;
+      destroyRef.onDestroy(() => subscriptions.forEach((sub) => sub.unsubscribe()));
+    }
+
+    return {
+      unsubscribe: () => {
+        if (manualUnsubscribe) {
+          subscriptions.forEach((sub) => sub.unsubscribe());
+        }
+      },
+    };
+  }
 
   /**
    * Returns a Signal for observing the latest event for a specific key, or null if none exists.

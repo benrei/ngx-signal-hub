@@ -2,4 +2,4 @@
  * Public API Surface of ngx-signal-hub
  */
 
-export * from './lib/signal-bus.service';
+export * from './lib/signal-hub.service';
