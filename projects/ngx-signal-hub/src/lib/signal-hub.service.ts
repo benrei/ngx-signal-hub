@@ -571,24 +571,67 @@ export class SignalHubService {
   }
 
   /**
-   * Returns a Signal for observing the latest events for multiple keys, returning an array of matches.
+   * Returns a Signal for observing the latest events for multiple keys or wildcard patterns,
+   * returning an array of matching events.
    *
-   * @param keys - Array of event keys to observe.
-   * @returns A Signal emitting an array of matching HubEvents.
-   * @throws Error if keys array is empty or contains invalid keys.
+   * @param keys - Array of event keys or wildcard patterns to observe (e.g., `['user:login', 'user:*']`).
+   * @param options - Optional configuration for sorting the returned events.
+   * @param options.sortBy - Sorts the events by `'timestamp'` (descending, latest first) or `'key'` (alphabetically).
+   * @returns A Signal emitting an array of matching HubEvents, deduplicated by key.
+   * @throws Error if the keys array is empty or contains invalid (empty) keys.
    *
    * @example
    * ```typescript
-   * const events = signalHub.toSignalMultiple(['user:login', 'user:logout']);
-   * effect(() => console.log(events()));
+   * // Observe specific and wildcard keys
+   * const events = signalHub.toSignalMultiple(['user:login', 'user:*'], { sortBy: 'timestamp' });
+   * effect(() => console.log(events().map(e => `${e.key}: ${e.data}`)));
+   *
+   * // Publish events
+   * signalHub.publish('user:login', { id: 123 });
+   * signalHub.publish('user:logout', { id: 456 });
+   *
+   * // Output might be: ["user:logout: {id: 456}", "user:login: {id: 123}"] (sorted by timestamp)
    * ```
    */
-  toSignalMultiple<T>(keys: string[]): Signal<HubEvent<T>[]> {
+  toSignalMultiple<T>(
+    keys: string[],
+    options: { sortBy?: 'timestamp' | 'key' } = {}
+  ): Signal<HubEvent<T>[]> {
     if (!keys.length) throw new Error('Keys array cannot be empty');
     if (keys.some((key) => !key)) throw new Error('All keys must be non-empty');
+
     return computed(() => {
       const registry = this.eventRegistry();
-      return keys.map((key) => registry.get(key) as HubEvent<T>).filter(Boolean);
+      const matchingEvents: HubEvent<T>[] = [];
+
+      // Track unique event keys to avoid duplicates
+      const seenKeys = new Set<string>();
+
+      for (const key of keys) {
+        if (!key.includes('*')) {
+          // Exact key match
+          const event = registry.get(key) as HubEvent<T> | undefined;
+          if (event && !seenKeys.has(event.key)) {
+            matchingEvents.push(event);
+            seenKeys.add(event.key);
+          }
+        } else {
+          // Wildcard match
+          for (const [eventKey, event] of registry) {
+            if (this.matchQuery(eventKey, key) && !seenKeys.has(eventKey)) {
+              matchingEvents.push(event as HubEvent<T>);
+              seenKeys.add(eventKey);
+            }
+          }
+        }
+      }
+
+      if (options.sortBy === 'timestamp') {
+        return matchingEvents.sort((a, b) => b.timestamp - a.timestamp);
+      } else if (options.sortBy === 'key') {
+        return matchingEvents.sort((a, b) => a.key.localeCompare(b.key));
+      }
+      return matchingEvents;
     });
   }
 
