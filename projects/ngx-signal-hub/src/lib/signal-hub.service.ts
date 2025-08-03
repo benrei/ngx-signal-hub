@@ -1,30 +1,26 @@
 import {
-  DestroyRef,
   Injectable,
   Injector,
   effect,
   signal,
   computed,
-  untracked,
   Signal,
+  untracked,
+  DestroyRef,
 } from '@angular/core';
 
-/**
- * Represents an event in the signal hub with a key, data, and timestamp.
- */
+/** Represents an event in the signal hub with a key, data, and timestamp. */
 export interface HubEvent<T = unknown> {
   key: string;
   data: T;
   timestamp: number;
 }
 
-/**
- * Represents the options for subscribing to a signal hub event.
- */
+/** Represents the options for subscribing to a single signal hub event. */
 export interface HubEventOptions<T> {
-  /** The key/query string to match events against (e.g., 'user:login', 'user:*'). */
+  /** The key to match events against (e.g., 'user:login'). */
   key: string;
-  /** The callback function to execute when an event matches the query. */
+  /** The callback function to execute when an event matches the key. */
   callback: (event: HubEvent<T>) => void | Promise<void>;
   /** Optional DestroyRef for auto-cleaning subscriptions. */
   destroyRef?: DestroyRef;
@@ -32,621 +28,217 @@ export interface HubEventOptions<T> {
   replayLatest?: boolean;
   /** Optional error handler for callback errors. */
   onError?: (error: unknown, event: HubEvent<T>) => void;
+  /** Optional condition(s) to unsubscribe when true (signal) or when event is received (key). */
+  until?: (string | Signal<boolean>) | (string | Signal<boolean>)[];
 }
 
-/**
- * Represents a subscription to the signal hub.
- */
+/** Represents the options for subscribing to multiple signal hub events with combineLatest behavior. */
+export interface HubCombineLatestOptions<T> {
+  /** Array of keys to match events against (e.g., ['user:login', 'user:logout']). */
+  keys: string[];
+  /** The callback function to execute with the latest events for all keys. */
+  callback: (events: HubEvent<T>[]) => void | Promise<void>;
+  /** Optional DestroyRef for auto-cleaning subscriptions. */
+  destroyRef?: DestroyRef;
+  /** If true, replays the latest events for the keys on subscription. */
+  replayLatest?: boolean;
+  /** Optional error handler for callback errors. */
+  onError?: (error: unknown, events: HubEvent<T>[]) => void;
+  /** Optional sorting for combined events (e.g., 'timestamp' or 'key'). */
+  sortBy?: 'timestamp' | 'key';
+}
+
+/** Represents a subscription to the signal hub. */
 export interface HubSubscription {
   unsubscribe: () => void;
 }
 
-/**
- * A hybrid signal hub service for publishing and observing events using Signals and callbacks.
- * Supports pub/sub with key-based routing, pattern matching, and Signal-based event observation.
- *
- * @example
- * ```typescript
- * @Component({...})
- * export class MyComponent {
- *   constructor(private signalHub: SignalHubService, private destroyRef: DestroyRef) {
- *     // Synchronous subscription
- *     this.signalHub.on({
- *       key: 'user:*',
- *       callback: (event) => console.log(event.data),
- *       destroyRef: this.destroyRef,
- *       replayLatest: true,
- *     });
- *
- *     // Asynchronous subscription
- *     this.signalHub.onAsync({
- *       key: 'user:login',
- *       callback: async (event) => {
- *         await fetch('/log', { method: 'POST', body: JSON.stringify(event.data) });
- *         console.log(event.data);
- *       },
- *       replayLatest: true,
- *       onError: (err) => console.error('Event error:', err),
- *     });
- *
- *     // Publish an event
- *     this.signalHub.publish('user:login', { id: 123 });
- *
- *     // Clear a specific event
- *     this.signalHub.clearEvent('user:login');
- *
- *     // Reset everything
- *     this.signalHub.reset({ clearSubscribers: true });
- *   }
- * }
- * ```
- */
 @Injectable({ providedIn: 'root' })
 export class SignalHubService {
-  private readonly eventQueue = signal<HubEvent[]>([]);
-  private readonly eventRegistry = signal<Map<string, HubEvent>>(new Map());
+  private readonly eventRegistry = signal<Map<string, HubEvent>>(new Map(), {
+    equal: (a, b) => a === b,
+  });
+
   private readonly subscribers = new Map<
     string,
-    Array<{
-      callback: (event: HubEvent<unknown>) => void | Promise<void>;
-      onError?: (error: unknown, event: HubEvent<unknown>) => void;
+    Set<{
+      callback: (event: HubEvent) => void | Promise<void>;
+      onError?: (error: unknown, event: HubEvent) => void;
     }>
   >();
 
-  constructor(injector: Injector) {
-    effect(
+  constructor(private readonly injector: Injector) {}
+
+  publish<T = unknown>(key: string, data?: T): void {
+    if (!key) throw new Error('Key cannot be empty');
+
+    const event: HubEvent<T> = { key, data: data as T, timestamp: Date.now() };
+    this.eventRegistry.update((registry) => new Map(registry).set(key, event));
+    this.notifySubscribers(event);
+  }
+
+  on<T>(options: HubEventOptions<T>): HubSubscription {
+    const { key, callback, destroyRef, replayLatest, onError, until } = options;
+    if (!key) throw new Error('Key cannot be empty');
+    if (typeof callback !== 'function') throw new Error('Callback must be a function');
+
+    const unsubscribers: (() => void)[] = [];
+    let mainSubscription: HubSubscription | null = null;
+
+    // Handle unsubscription conditions (from takeUntil)
+    const unsubscribeAll = () => {
+      unsubscribers.forEach((unsub) => unsub());
+      mainSubscription?.unsubscribe();
+    };
+
+    if (until) {
+      const conditions = Array.isArray(until) ? until : [until];
+      // Check signals immediately
+      const signals = conditions.filter((c): c is Signal<boolean> => typeof c !== 'string');
+      if (signals.some((signal) => signal())) {
+        return { unsubscribe: () => {} };
+      }
+
+      for (const condition of conditions) {
+        if (typeof condition === 'string') {
+          const sub = this.internalSubscribe(condition, unsubscribeAll, undefined, undefined, true);
+          unsubscribers.push(sub.unsubscribe);
+        } else {
+          const signal = condition;
+          const effectRef = effect(
+            () => {
+              if (signal()) unsubscribeAll();
+            },
+            { injector: this.injector }
+          );
+          unsubscribers.push(() => effectRef.destroy());
+        }
+      }
+    }
+
+    // Replay latest event if requested
+    if (replayLatest) {
+      untracked(() => {
+        const latestEvent = this.findLatestEventForKey(key) as HubEvent<T> | undefined;
+        if (latestEvent) {
+          try {
+            callback(latestEvent);
+          } catch (error) {
+            this.handleError(error, latestEvent, onError, key);
+          }
+        }
+      });
+    }
+
+    mainSubscription = this.internalSubscribe(key, callback, destroyRef, onError);
+    return { unsubscribe: unsubscribeAll };
+  }
+
+  subscribe = this.on;
+
+  once<T>({ key, callback, replayLatest, onError, until }: HubEventOptions<T>): HubSubscription {
+    let subscription: HubSubscription | null = null;
+    const onceCallback = (event: HubEvent<T>) => {
+      subscription?.unsubscribe();
+      try {
+        callback(event);
+      } catch (error) {
+        this.handleError(error, event, onError, key);
+      }
+    };
+    subscription = this.on({ key, callback: onceCallback, replayLatest, onError, until });
+    return subscription;
+  }
+
+  onCombineLatest<T>(options: HubCombineLatestOptions<T>): HubSubscription {
+    const { keys, callback, destroyRef, replayLatest, onError, sortBy } = options;
+    if (!keys?.length) throw new Error('Keys array cannot be empty');
+
+    const sourceSignals = keys.map((key) => this.toSignal<T>(key));
+    const combinedSignal = computed(() => {
+      const events = sourceSignals.map((s) => s()).filter((e): e is HubEvent<T> => e !== null);
+      if (events.length === keys.length) {
+        return sortBy === 'timestamp'
+          ? events.sort((a, b) => b.timestamp - a.timestamp)
+          : sortBy === 'key'
+          ? events.sort((a, b) => a.key.localeCompare(b.key))
+          : events;
+      }
+      return null;
+    });
+
+    const effectRef = effect(
       () => {
-        const queuedEvents = this.eventQueue();
-        if (!queuedEvents.length) return;
+        const combinedEvents = combinedSignal();
+        if (!combinedEvents) return;
+        if (!replayLatest && !this.eventRegistry().size) return;
 
-        untracked(() => {
-          const registry = this.eventRegistry();
-          const updatedRegistry = new Map(registry);
-
-          for (const event of queuedEvents) {
-            updatedRegistry.set(event.key, event);
-            this.notifySubscribers(event);
-          }
-
-          this.eventRegistry.set(updatedRegistry);
-          this.eventQueue.set([]);
-        });
-      },
-      { injector }
-    );
-  }
-
-  /**
-   * Publishes an event with the given key and data, triggering subscribers and updating the registry.
-   *
-   * @param key - The event key (e.g., 'user:login').
-   * @param data - The event data (must not be null or undefined).
-   * @throws Error if key is empty or data is null/undefined.
-   *
-   * @example
-   * ```typescript
-   * signalHub.publish('user:login', { id: 123 });
-   * // Triggers subscribers to 'user:login' or 'user:*'
-   * ```
-   */
-  publish<T>(key: string, data: T): void {
-    if (!key) throw new Error('Key cannot be empty');
-    if (data == null) throw new Error('Data cannot be null or undefined');
-
-    const event: HubEvent<T> = { key, data, timestamp: Date.now() };
-    this.eventQueue.update((queue) => [...queue, event]);
-  }
-
-  /**
-   * Publishes an event with the given key, triggering subscribers and updating the registry.
-   *
-   * @param key - The event key (e.g., 'user:login').
-   * @throws Error if key is empty.
-   *
-   * @example
-   * ```typescript
-   * signalHub.publish('user:login');
-   * // Triggers subscribers to 'user:login' or 'user:*'
-   * ```
-   */
-  publishNoData(key: string): void {
-    if (!key) throw new Error('Key cannot be empty');
-    const event: HubEvent<undefined> = { key, data: undefined, timestamp: Date.now() };
-    this.eventQueue.update((queue) => [...queue, event]);
-  }
-
-  /**
-   * Subscribes to events matching a query with a synchronous callback, optionally auto-cleaning with DestroyRef.
-   * Supports pattern matching (e.g., 'user:*') and optional replay of the latest event.
-   *
-   * @param options - Subscription options including key, callback, and optional settings.
-   * @returns A HubSubscription object with an unsubscribe method.
-   * @throws Error if key is empty or callback is not a function.
-   *
-   * @example
-   * ```typescript
-   * signalHub.subscribe({
-   *   key: 'user:*',
-   *   callback: (event) => console.log(event.data),
-   *   replayLatest: true,
-   *   destroyRef: inject(DestroyRef),
-   *   onError: (err) => console.error('Error:', err),
-   * });
-   * ```
-   */
-  subscribe<T>({
-    key,
-    callback,
-    destroyRef,
-    replayLatest,
-    onError,
-  }: HubEventOptions<T>): HubSubscription {
-    if (!key) throw new Error('Key cannot be empty');
-    if (typeof callback !== 'function') throw new Error('Callback must be a function');
-
-    if (replayLatest) {
-      const latestEvent = this.eventRegistry().get(key) as HubEvent<T> | undefined;
-      if (latestEvent) {
         try {
-          callback(latestEvent);
+          callback(combinedEvents);
         } catch (error) {
-          if (onError) {
-            onError(error, latestEvent);
-          } else {
-            console.warn(`Replay error for query "${key}":`, error);
-          }
+          onError
+            ? onError(error, combinedEvents)
+            : console.warn(`onCombineLatest error for keys [${keys.join(', ')}]:`, error);
         }
-      }
-    }
-    return this.internalSubscribe(key, callback, destroyRef, onError);
-  }
-
-  /**
-   * Subscribes to events matching a query with an asynchronous callback, optionally auto-cleaning with DestroyRef.
-   * Supports pattern matching (e.g., 'user:*') and optional replay of the latest event.
-   *
-   * @param options - Subscription options including key, callback, and optional settings.
-   * @returns A Promise resolving to a HubSubscription object with an unsubscribe method.
-   * @throws Error if key is empty or callback is not a function.
-   *
-   * @example
-   * ```typescript
-   * await signalHub.subscribeAsync({
-   *   key: 'user:*',
-   *   callback: async (event) => console.log(event.data),
-   *   replayLatest: true,
-   *   destroyRef: inject(DestroyRef),
-   *   onError: (err) => console.error('Error:', err),
-   * });
-   * ```
-   */
-  async subscribeAsync<T>({
-    key,
-    callback,
-    destroyRef,
-    replayLatest,
-    onError,
-  }: HubEventOptions<T>): Promise<HubSubscription> {
-    if (!key) throw new Error('Key cannot be empty');
-    if (typeof callback !== 'function') throw new Error('Callback must be a function');
-
-    if (replayLatest) {
-      const latestEvent = this.eventRegistry().get(key) as HubEvent<T> | undefined;
-      if (latestEvent) {
-        try {
-          await callback(latestEvent);
-        } catch (error) {
-          if (onError) {
-            onError(error, latestEvent);
-          } else {
-            console.warn(`Replay error for query "${key}":`, error);
-          }
-        }
-      }
-    }
-    return this.internalSubscribe(key, callback, destroyRef, onError);
-  }
-
-  /**
-   * A shorthand for subscribing to events with a synchronous callback, with optional replay and auto-cleanup.
-   *
-   * @param options - Options including key, callback, and optional replayLatest, destroyRef, and onError.
-   * @returns A HubSubscription object with an unsubscribe method.
-   *
-   * @example
-   * ```typescript
-   * signalHub.on({
-   *   key: 'user:login',
-   *   callback: (event) => console.log(event.data),
-   *   replayLatest: true,
-   *   destroyRef: inject(DestroyRef),
-   *   onError: (err) => console.error('Error:', err),
-   * });
-   * ```
-   */
-  on<T>({ key, callback, replayLatest, destroyRef, onError }: HubEventOptions<T>): HubSubscription {
-    return this.subscribe({ key, callback, replayLatest, destroyRef, onError });
-  }
-
-  /**
-   * A shorthand for subscribing to events with an asynchronous callback, with optional replay and auto-cleanup.
-   *
-   * @param options - Options including key, callback, and optional replayLatest, destroyRef, and onError.
-   * @returns A Promise resolving to a HubSubscription object with an unsubscribe method.
-   *
-   * @example
-   * ```typescript
-   * await signalHub.onAsync({
-   *   key: 'user:login',
-   *   callback: async (event) => console.log(event.data),
-   *   replayLatest: true,
-   *   destroyRef: inject(DestroyRef),
-   *   onError: (err) => console.error('Error:', err),
-   * });
-   * ```
-   */
-  async onAsync<T>({
-    key,
-    callback,
-    replayLatest,
-    destroyRef,
-    onError,
-  }: HubEventOptions<T>): Promise<HubSubscription> {
-    return this.subscribeAsync({ key, callback, replayLatest, destroyRef, onError });
-  }
-
-  /**
-   * Subscribes to a single event matching the key with a synchronous callback, auto-unsubscribing after the first match.
-   *
-   * @param options - Options including key, callback, and optional replayLatest and onError.
-   * @returns A HubSubscription object with an unsubscribe method.
-   *
-   * @example
-   * ```typescript
-   * signalHub.once({
-   *   key: 'user:login',
-   *   callback: (event) => console.log('Logged in:', event.data),
-   *   replayLatest: true,
-   *   onError: (err) => console.error('Error:', err),
-   * });
-   * ```
-   */
-  once<T>({ key, callback, replayLatest, onError }: HubEventOptions<T>): HubSubscription {
-    let subscription: HubSubscription | null = null;
-    // Guarantees the callback runs exactly once, even in the same `notifySubscribers` cycle.
-    let hasRun = false;
-
-    subscription = this.subscribe({
-      key,
-      callback: (event) => {
-        if (hasRun) return; // Skip if already run.
-        hasRun = true;
-        subscription?.unsubscribe(); // Unsubscribe first
-        callback(event as HubEvent<T>);
       },
-      replayLatest,
-      onError,
-    });
-    return subscription;
-  }
-
-  /**
-   * Subscribes to a single event matching the key with an asynchronous callback, auto-unsubscribing after the first match.
-   *
-   * @param options - Options including key, callback, and optional replayLatest and onError.
-   * @returns A Promise resolving to a HubSubscription object with an unsubscribe method.
-   *
-   * @example
-   * ```typescript
-   * await signalHub.onceAsync({
-   *   key: 'user:login',
-   *   callback: async (event) => console.log('Logged in:', event.data),
-   *   replayLatest: true,
-   *   onError: (err) => console.error('Error:', err),
-   * });
-   * ```
-   */
-  async onceAsync<T>({
-    key,
-    callback,
-    replayLatest,
-    onError,
-  }: HubEventOptions<T>): Promise<HubSubscription> {
-    let subscription: HubSubscription | null = null;
-    subscription = await this.subscribeAsync({
-      key,
-      callback: async (event) => {
-        await callback(event as HubEvent<T>);
-        subscription?.unsubscribe();
-      },
-      replayLatest,
-      onError,
-    });
-    return subscription;
-  }
-  /**
-   * Subscribes to the latest events from multiple keys, invoking the callback with an array of events
-   * whenever any key emits a new event, provided all keys have emitted at least once.
-   *
-   * @param options - Options including keys, callback, and optional settings.
-   * @returns A HubSubscription object with an unsubscribe method.
-   * @throws Error if keys array is empty or contains invalid keys.
-   *
-   * @example
-   * ```typescript
-   * signalHub.onCombineLatest({
-   *   keys: ['user:login', 'user:logout'],
-   *   callback: (events) => console.log(events.map(e => e.data)),
-   *   replayLatest: true,
-   *   destroyRef: inject(DestroyRef),
-   *   onError: (err, events) => console.error('Error:', err, events),
-   * });
-   * ```
-   */
-  onCombineLatest<T>({
-    keys,
-    callback,
-    destroyRef,
-    replayLatest,
-    onError,
-  }: {
-    keys: string[];
-    callback: (events: HubEvent<T>[]) => void | Promise<void>;
-    destroyRef?: DestroyRef;
-    replayLatest?: boolean;
-    onError?: (error: unknown, events: HubEvent<T>[]) => void;
-  }): HubSubscription {
-    if (!keys.length) throw new Error('Keys array cannot be empty');
-    if (keys.some((key) => !key)) throw new Error('All keys must be non-empty');
-
-    const safeCallback = callback as (events: HubEvent<unknown>[]) => void | Promise<void>;
-    const safeOnError = onError as
-      | ((error: unknown, events: HubEvent<unknown>[]) => void)
-      | undefined;
-
-    // Check if all keys have events for replay
-    if (replayLatest) {
-      const registry = this.eventRegistry();
-      const latestEvents = keys.map((key) => registry.get(key) as HubEvent<T>).filter(Boolean);
-      if (latestEvents.length === keys.length) {
-        try {
-          safeCallback(latestEvents);
-        } catch (error) {
-          if (safeOnError) {
-            safeOnError(error, latestEvents);
-          } else {
-            console.warn(`Replay error for combineLatest:`, error);
-          }
-        }
-      }
-    }
-
-    // Subscribe to each key
-    const subscriptions = keys.map((key) =>
-      this.on({
-        key,
-        callback: () => {
-          // Check if all keys have events
-          const registry = this.eventRegistry();
-          const events = keys.map((k) => registry.get(k) as HubEvent<T>).filter(Boolean);
-          if (events.length === keys.length) {
-            try {
-              safeCallback(events);
-            } catch (error) {
-              if (safeOnError) {
-                safeOnError(error, events);
-              } else {
-                console.warn(`Callback error for combineLatest:`, error);
-              }
-            }
-          }
-        },
-        // Adapt onError for single event
-        onError: safeOnError
-          ? (error, event) => safeOnError(error, [event]) // Wrap single event in array
-          : undefined,
-      })
+      { injector: this.injector }
     );
 
-    // Handle unsubscribe
-    let manualUnsubscribe = true;
+    const unsubscribe = () => effectRef.destroy();
     if (destroyRef) {
-      manualUnsubscribe = false;
-      destroyRef.onDestroy(() => subscriptions.forEach((sub) => sub.unsubscribe()));
+      destroyRef.onDestroy(unsubscribe);
     }
 
-    return {
-      unsubscribe: () => {
-        if (manualUnsubscribe) {
-          subscriptions.forEach((sub) => sub.unsubscribe());
-        }
-      },
-    };
+    return { unsubscribe };
   }
 
-  /**
-   * Subscribes to the latest events from multiple keys with an asynchronous callback,
-   * invoking the callback with an array of events whenever any key emits a new event,
-   * provided all keys have emitted at least once.
-   *
-   * @param options - Options including keys, callback, and optional settings.
-   * @returns A Promise resolving to a HubSubscription object with an unsubscribe method.
-   * @throws Error if keys array is empty or contains invalid keys.
-   */
-  async onCombineLatestAsync<T>({
-    keys,
-    callback,
-    destroyRef,
-    replayLatest,
-    onError,
-  }: {
-    keys: string[];
-    callback: (events: HubEvent<T>[]) => Promise<void>;
-    destroyRef?: DestroyRef;
-    replayLatest?: boolean;
-    onError?: (error: unknown, events: HubEvent<T>[]) => void;
-  }): Promise<HubSubscription> {
-    if (!keys.length) throw new Error('Keys array cannot be empty');
-    if (keys.some((key) => !key)) throw new Error('All keys must be non-empty');
-
-    const safeCallback = callback as (events: HubEvent<unknown>[]) => Promise<void>;
-    const safeOnError = onError as
-      | ((error: unknown, events: HubEvent<unknown>[]) => void)
-      | undefined;
-
-    // Check if all keys have events for replay
-    if (replayLatest) {
-      const registry = this.eventRegistry();
-      const latestEvents = keys.map((key) => registry.get(key) as HubEvent<T>).filter(Boolean);
-      if (latestEvents.length === keys.length) {
-        try {
-          await safeCallback(latestEvents);
-        } catch (error) {
-          if (safeOnError) {
-            safeOnError(error, latestEvents);
-          } else {
-            console.warn(`Replay error for combineLatestAsync:`, error);
-          }
-        }
-      }
-    }
-
-    // Subscribe to each key
-    const subscriptions = keys.map((key) =>
-      this.on({
-        key,
-        callback: async () => {
-          // Check if all keys have events
-          const registry = this.eventRegistry();
-          const events = keys.map((k) => registry.get(k) as HubEvent<T>).filter(Boolean);
-          if (events.length === keys.length) {
-            try {
-              await safeCallback(events);
-            } catch (error) {
-              if (safeOnError) {
-                safeOnError(error, events);
-              } else {
-                console.warn(`Callback error for combineLatestAsync:`, error);
-              }
-            }
-          }
-        },
-        // Adapt onError for single event
-        onError: safeOnError ? (error, event) => safeOnError(error, [event]) : undefined,
-      })
-    );
-
-    // Handle unsubscribe
-    let manualUnsubscribe = true;
-    if (destroyRef) {
-      manualUnsubscribe = false;
-      destroyRef.onDestroy(() => subscriptions.forEach((sub) => sub.unsubscribe()));
-    }
-
-    return {
-      unsubscribe: () => {
-        if (manualUnsubscribe) {
-          subscriptions.forEach((sub) => sub.unsubscribe());
-        }
-      },
-    };
-  }
-
-  /**
-   * Returns a Signal for observing the latest event for a specific key, or null if none exists.
-   *
-   * @param key - The event key to observe (e.g., 'user:login').
-   * @returns A Signal emitting the latest HubEvent or null.
-   * @throws Error if key is empty.
-   *
-   * @example
-   * ```typescript
-   * const userLogin = signalHub.toSignal('user:login');
-   * effect(() => console.log(userLogin()?.data));
-   * ```
-   */
   toSignal<T>(key: string): Signal<HubEvent<T> | null> {
     if (!key) throw new Error('Key cannot be empty');
-    return computed(() => this.eventRegistry().get(key) as HubEvent<T> | null);
+    if (key.includes('*'))
+      throw new Error('toSignal does not support wildcards. Use toSignalMultiple instead.');
+
+    return computed(() => (this.eventRegistry().get(key) as HubEvent<T>) ?? null);
   }
 
-  /**
-   * Returns a Signal for observing the latest events for multiple keys or wildcard patterns,
-   * returning an array of matching events.
-   *
-   * @param keys - Array of event keys or wildcard patterns to observe (e.g., `['user:login', 'user:*']`).
-   * @param options - Optional configuration for sorting the returned events.
-   * @param options.sortBy - Sorts the events by `'timestamp'` (descending, latest first) or `'key'` (alphabetically).
-   * @returns A Signal emitting an array of matching HubEvents, deduplicated by key.
-   * @throws Error if the keys array is empty or contains invalid (empty) keys.
-   *
-   * @example
-   * ```typescript
-   * // Observe specific and wildcard keys
-   * const events = signalHub.toSignalMultiple(['user:login', 'user:*'], { sortBy: 'timestamp' });
-   * effect(() => console.log(events().map(e => `${e.key}: ${e.data}`)));
-   *
-   * // Publish events
-   * signalHub.publish('user:login', { id: 123 });
-   * signalHub.publish('user:logout', { id: 456 });
-   *
-   * // Output might be: ["user:logout: {id: 456}", "user:login: {id: 123}"] (sorted by timestamp)
-   * ```
-   */
   toSignalMultiple<T>(
     keys: string[],
     options: { sortBy?: 'timestamp' | 'key' } = {}
   ): Signal<HubEvent<T>[]> {
-    if (!keys.length) throw new Error('Keys array cannot be empty');
-    if (keys.some((key) => !key)) throw new Error('All keys must be non-empty');
+    if (!keys?.length) throw new Error('Keys array cannot be empty');
 
     return computed(() => {
       const registry = this.eventRegistry();
-      const matchingEvents: HubEvent<T>[] = [];
+      const matchingEvents = new Map<string, HubEvent<T>>();
 
-      // Track unique event keys to avoid duplicates
-      const seenKeys = new Set<string>();
-
-      for (const key of keys) {
-        if (!key.includes('*')) {
-          // Exact key match
-          const event = registry.get(key) as HubEvent<T> | undefined;
-          if (event && !seenKeys.has(event.key)) {
-            matchingEvents.push(event);
-            seenKeys.add(event.key);
+      for (const query of keys) {
+        if (!query) continue;
+        const isWildcard = query.includes('*');
+        if (!isWildcard) {
+          const event = registry.get(query) as HubEvent<T> | undefined;
+          if (event) {
+            matchingEvents.set(event.key, event);
           }
         } else {
-          // Wildcard match
-          for (const [eventKey, event] of registry) {
-            if (this.matchQuery(eventKey, key) && !seenKeys.has(eventKey)) {
-              matchingEvents.push(event as HubEvent<T>);
-              seenKeys.add(eventKey);
+          const regex = this.buildWildcardRegex(query);
+          for (const [eventKey, event] of registry.entries()) {
+            if (regex.test(eventKey)) {
+              matchingEvents.set(eventKey, event as HubEvent<T>);
             }
           }
         }
       }
 
+      const eventsArray = Array.from(matchingEvents.values());
       if (options.sortBy === 'timestamp') {
-        return matchingEvents.sort((a, b) => b.timestamp - a.timestamp);
-      } else if (options.sortBy === 'key') {
-        return matchingEvents.sort((a, b) => a.key.localeCompare(b.key));
+        return eventsArray.sort((a, b) => b.timestamp - a.timestamp);
       }
-      return matchingEvents;
+      if (options.sortBy === 'key') {
+        return eventsArray.sort((a, b) => a.key.localeCompare(b.key));
+      }
+      return eventsArray;
     });
   }
 
-  /**
-   * Clears a specific event from the registry by its key.
-   *
-   * @param key - The event key to clear.
-   * @throws Error if key is empty.
-   *
-   * @example
-   * ```typescript
-   * signalHub.clearEvent('user:login');
-   * // Removes 'user:login' from the registry, affecting replayLatest and signals
-   * ```
-   */
   clearEvent(key: string): void {
     if (!key) throw new Error('Key cannot be empty');
     this.eventRegistry.update((registry) => {
@@ -656,40 +248,9 @@ export class SignalHubService {
     });
   }
 
-  /**
-   * Resets the event registry, optionally clearing all subscribers.
-   *
-   * @param options - Optional settings for the reset operation.
-   * @param options.clearSubscribers - If true, also clears all subscribers (default: false).
-   *
-   * @example
-   * ```typescript
-   * signalHub.reset(); // Clears event registry only
-   * signalHub.reset({ clearSubscribers: true }); // Clears registry and subscribers
-   * ```
-   */
   reset(options: { clearSubscribers?: boolean } = {}): void {
     this.eventRegistry.set(new Map());
     if (options.clearSubscribers) {
-      this.subscribers.clear();
-    }
-  }
-
-  /**
-   * Unsubscribes all callbacks for a specific key or all subscribers if no key is provided.
-   *
-   * @param key - Optional key to unsubscribe all callbacks for. If omitted, all subscribers are removed.
-   *
-   * @example
-   * ```typescript
-   * signalHub.unsubscribeAll('user:login'); // Remove all 'user:login' subscribers
-   * signalHub.unsubscribeAll(); // Remove all subscribers
-   * ```
-   */
-  unsubscribeAll(key?: string): void {
-    if (key) {
-      this.subscribers.delete(key);
-    } else {
       this.subscribers.clear();
     }
   }
@@ -698,81 +259,89 @@ export class SignalHubService {
     query: string,
     callback: (event: HubEvent<T>) => void | Promise<void>,
     destroyRef?: DestroyRef,
-    onError?: (error: unknown, event: HubEvent<T>) => void
+    onError?: (error: unknown, event: HubEvent<T>) => void,
+    once = false
   ): HubSubscription {
-    const safeCallback = callback as (event: HubEvent<unknown>) => void | Promise<void>;
-    const safeOnError = onError as ((error: unknown, event: HubEvent<unknown>) => void) | undefined;
-    const callbacks = this.subscribers.get(query) ?? [];
-    callbacks.push({ callback: safeCallback, onError: safeOnError });
-    this.subscribers.set(query, callbacks);
+    const subscriber = {
+      callback: callback as (event: HubEvent) => void | Promise<void>,
+      onError: onError as ((error: unknown, event: HubEvent) => void) | undefined,
+    };
 
-    let manualUnsubscribe = true;
-    if (destroyRef) {
-      manualUnsubscribe = false;
-      destroyRef.onDestroy(() => this.unsubscribe(query, safeCallback));
+    const subscriberSet = this.subscribers.get(query) ?? new Set();
+    subscriberSet.add(subscriber);
+    this.subscribers.set(query, subscriberSet);
+
+    const unsubscribe = () => {
+      const currentSubscribers = this.subscribers.get(query);
+      currentSubscribers?.delete(subscriber);
+      if (currentSubscribers?.size === 0) {
+        this.subscribers.delete(query);
+      }
+    };
+
+    if (once) {
+      const originalCallback = subscriber.callback;
+      subscriber.callback = (event: HubEvent) => {
+        unsubscribe();
+        return originalCallback(event);
+      };
     }
 
-    return {
-      unsubscribe: () => {
-        if (manualUnsubscribe) {
-          this.unsubscribe(query, safeCallback);
-        }
-      },
-    };
+    if (destroyRef) {
+      destroyRef.onDestroy(unsubscribe);
+    }
+
+    return { unsubscribe };
   }
 
-  private async notifySubscribers(event: HubEvent): Promise<void> {
-    const subscriberPromises: Promise<void>[] = [];
-
+  private notifySubscribers(event: HubEvent): void {
     this.subscribers.forEach((subscribers, query) => {
       if (this.matchQuery(event.key, query)) {
         subscribers.forEach(({ callback, onError }) => {
-          const promise = Promise.resolve()
-            .then(() => callback(event))
-            .catch((error) => {
-              if (onError) {
-                onError(error, event);
-              } else {
-                console.warn(`Subscriber error for query "${query}":`, error);
-              }
+          try {
+            Promise.resolve(callback(event)).catch((error) => {
+              this.handleError(error, event, onError, query);
             });
-          subscriberPromises.push(promise);
+          } catch (error) {
+            this.handleError(error, event, onError, query);
+          }
         });
       }
     });
-
-    await Promise.all(subscriberPromises);
   }
 
-  private unsubscribe<T>(
-    query: string,
-    callback: (event: HubEvent<T>) => void | Promise<void>
-  ): void {
-    const callbacks = this.subscribers.get(query);
-    if (!callbacks) return;
+  private findLatestEventForKey(key: string): HubEvent | undefined {
+    if (!key.includes('*')) {
+      return this.eventRegistry().get(key);
+    }
+    const regex = this.buildWildcardRegex(key);
+    let latestEvent: HubEvent | undefined;
+    for (const [eventKey, event] of this.eventRegistry().entries()) {
+      if (regex.test(eventKey)) {
+        if (!latestEvent || event.timestamp > latestEvent.timestamp) {
+          latestEvent = event;
+        }
+      }
+    }
+    return latestEvent;
+  }
 
-    const updatedCallbacks = callbacks.filter(
-      (sub) => sub.callback !== (callback as (event: HubEvent<unknown>) => void | Promise<void>)
-    );
-    if (updatedCallbacks.length) {
-      this.subscribers.set(query, updatedCallbacks);
+  private handleError(error: unknown, event: HubEvent, handler?: Function, query?: string): void {
+    if (handler) {
+      handler(error, event);
     } else {
-      this.subscribers.delete(query);
+      console.warn(`SignalHub error for query "${query}" on event "${event.key}":`, error);
     }
   }
 
   private matchQuery(key: string, query: string): boolean {
-    if (key === query) return true;
+    if (query === '*' || key === query) return true;
+    if (!query.includes('*')) return false;
+    return this.buildWildcardRegex(query).test(key);
+  }
 
-    if (query === '*') return true;
-
-    if (key.includes(':') && query.includes(':')) {
-      const [keyPart1] = key.split(':');
-      const [queryPart1, queryPart2] = query.split(':');
-
-      if (keyPart1 === queryPart1 && queryPart2 === '*') return true;
-    }
-
-    return false;
+  private buildWildcardRegex(query: string): RegExp {
+    const pattern = query.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '[^:]+');
+    return new RegExp(`^${pattern}$`);
   }
 }

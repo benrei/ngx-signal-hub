@@ -1,37 +1,29 @@
-# ngx-signal-hub ✨
+# ngx-signal-hub
 
 [![npm version](https://badge.fury.io/js/ngx-signal-hub.svg)](https://badge.fury.io/js/ngx-signal-hub)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-A lightweight, reactive signal hub service for Angular applications built using **Angular Signals**. It offers a hybrid approach, allowing both traditional callback-based subscriptions and efficient Signal-based observation of the latest event state.
 
-Perfect for decoupled communication between components, services, or modules within your Angular application.
+A lightweight, reactive event hub for Angular applications using Angular Signals. Enables decoupled communication with both callback-based subscriptions and Signal-based event observation.
 
-
-## [Playground (Stackblitz)](https://stackblitz.com/edit/ngx-signal-hub)
-
+[Playground (Stackblitz)](https://stackblitz.com/edit/ngx-signal-hub?file=src%2Fmain.ts)
 
 ## Why ngx-signal-hub?
 
-* **Leverages Angular Signals:** Built upon `@angular/core/signals` (`signal`, `computed`, `effect`) for a modern, reactive, and potentially more performant event handling mechanism compared to older patterns.
-* **Hybrid Approach:** Get the best of both worlds:
-    * Use  `on()`, `once()` or `subscribe()` for traditional callback logic that needs to react to *every* event emission.
-    * Use `toSignal()` or `toSignalMultiple()` to get a `Signal` representing the *latest* event data for specific keys, ideal for reactive UI updates or derived state.
-* **Automatic Cleanup:** Integrates seamlessly with `DestroyRef` to automatically unsubscribe callbacks, preventing common memory leaks in Angular applications.
-* **Simple & Type-Safe:** Provides a clean, minimal API with TypeScript support.
-* **Flexible Subscriptions:** Supports exact key matching, a global wildcard (`*`) to subscribe to all events, and prefix-based wildcard subscriptions using a colon (`:`) where `key: *` will match any key starting with `key:`.
+- **Angular Signals**: Built on `@angular/core/signals` for reactive event handling.
+- **Hybrid Approach**: Supports callback-based (`on`, `once`, `onCombineLatest`) and Signal-based (`toSignal`, `toSignalMultiple`) event observation.
+- **Automatic Cleanup**: Integrates with `DestroyRef` for memory leak prevention.
+- **Type-Safe**: Strong TypeScript support with generics for event data.
+- **Flexible Matching**: Supports exact keys, global wildcard (`*`), and prefix wildcards (e.g., `user:*`).
 
 ## Features
 
-* ✅ Emit events with a key and payload.
-* ✅ Subscribe to events using callbacks.
-* ✅ Watch the latest event(s) for specific keys as Signals.
-* ✅ Automatic unsubscription via `DestroyRef` or `once()`.
-* ✅ Manual unsubscription support.
-* ✅ Wildcard key subscriptions (`feature:*`, `*`).
-* ✅ Remove specific event keys from the registry (`clearEvent()`).
-* ✅ Reset the entire event registry (`reset()`).
-* ✅ Unsubscribes all callbacks for a specific key or all subscribers if no key is provided with `unsubscribeAll()`.
-* ✅ Lightweight and focused.
+- Emit events with `publish(key, data)`.
+- Subscribe to events with `on`, `once`.
+- Observe latest events with `toSignal` (single key) or `toSignalMultiple` (multiple keys/patterns).
+- Combine multiple events with `onCombineLatest`.
+- Clear specific events with `clearEvent(key)`.
+- Reset registry with `reset()`.
+- Lightweight and Angular-native.
 
 ## Installation
 
@@ -41,32 +33,26 @@ npm install ngx-signal-hub
 yarn add ngx-signal-hub
 ```
 
-**Compatibility**: Requires Angular v17 or higher (due to Signals).
+**Compatibility**: Requires Angular v17+ (Signals).
 
 ## Usage
-`SignalHubService` is provided in 'root', so you can inject it directly into your components, directives, or services.
 
-- `publish()`
-  - Publishes an event with the given key and data, triggering subscribers and updating the registry.
-- `on(), onAsync(), once(), onceAsync(), subscribe(), subscribeAsync()`
-   - Subscribes to events matching a key/query with a callback.
-- `toSignal()`
-   - Returns a Signal for observing the latest event for a specific key, or null if none exists.
-- `toSignalMultiple()`
-   - Returns a Signal for observing the latest events for multiple keys, returning an array of matches.
-- `clearEvent()`
-   - Clears a specific event from the registry by its key
-- `reset()`
-   - Resets the registry, removing all events.
-- `unsubscribeAll()`
-  - Unsubscribes all callbacks for a specific key or all subscribers if no key is provided.
+`SignalHubService` is provided in `root` for easy injection into components, services, or directives.
 
-### Basic examples
+- `publish(key, data)`: Publishes an event, triggering subscribers and updating the registry.
+- `on(options)` / `subscribe(options)`: Subscribes to events with a callback.
+- `once(options)`: Subscribes to a single event and auto-unsubscribes.
+- `onCombineLatest(options)`: Subscribes to multiple keys, emitting when all have values.
+- `toSignal(key)`: Returns a Signal for the latest event of a specific key.
+- `toSignalMultiple(keys, options)`: Returns a Signal for latest events matching multiple keys/patterns.
+- `clearEvent(key)`: Removes a specific event from the registry.
+- `reset(options)`: Clears the registry, optionally unsubscribing all callbacks.
+
+### Example
 
 ```ts
 import { Component, DestroyRef, inject } from '@angular/core';
-import { CommonModule } from '@angular/common';
-import { SignalHubService, HubEvent, HubSubscription } from 'ngx-signal-hub';
+import { SignalHubService, HubEvent } from 'ngx-signal-hub';
 
 interface DemoData {
   text: string;
@@ -76,30 +62,19 @@ interface DemoData {
 @Component({
   selector: 'app-root',
   standalone: true,
-  imports: [CommonModule],
   template: `
-    <h2>Signal Bus Demo</h2>
-
-    <div>
-      <h3>Emit Events</h3>
-      <button (click)="publishMessage()">Emit Message Event</button>
-      <button (click)="publishData()">Emit Data Event</button>
-    </div>
-
-    <hr />
-
-    <div>
-      <h3>Watch Events (Signal)</h3>
-      Data event: <br /> 
-      <pre>{{ dataSignal() | json }}</pre>
-      Message event: <br /> 
-      <pre>{{ messageSignal() | json }}</pre>
-    </div>
+    <h2>Signal Hub Demo</h2>
+    <button (click)="publishMessage()">Emit Message</button>
+    <button (click)="publishData()">Emit Data</button>
+    <hr>
+    <h3>Signal Output</h3>
+    <pre>Data: {{ dataSignal() | json }}</pre>
+    <pre>Message: {{ messageSignal() | json }}</pre>
   `,
 })
 export class App {
-  private readonly hub = inject(SignalHubService);
-  private readonly destroyRef = inject(DestroyRef);
+  private hub = inject(SignalHubService);
+  private destroyRef = inject(DestroyRef);
 
   dataSignal = this.hub.toSignal<DemoData>('data');
   messageSignal = this.hub.toSignal<string>('message');
@@ -107,24 +82,28 @@ export class App {
   constructor() {
     this.hub.on<DemoData>({
       key: 'data',
-      callback: (event) => console.log(`Data event: `, event);
-      destroyRef: this.destroyRef
+      callback: (event) => console.log('Data:', event),
+      destroyRef: this.destroyRef,
     });
 
     this.hub.once<string>({
       key: 'message',
-      callback: (event) => {
-        console.log('Only triggered once and then cleaned up', event);
-      }
+      callback: (event) => console.log('Message (once):', event),
+    });
+
+    this.hub.on({
+      key: 'data',
+      callback: (event) => console.log('Data until stopped:', event),
+      until: 'stop:event',
     });
   }
 
-  publishMessage(): void {
-    this.hub.publish('message', 'A simple message');
+  publishMessage() {
+    this.hub.publish('message', 'Hello World');
   }
 
-  publishData(): void {
-    this.hub.publish('data', { text: 'Hello from data event', value: 123 });
+  publishData() {
+    this.hub.publish('data', { text: 'Test', value: 42 });
   }
 }
 ```
